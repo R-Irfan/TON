@@ -1,0 +1,327 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
+from scipy import ndimage
+import shapely.geometry
+import shapely.ops
+from shapely.geometry import Point, Polygon, MultiPoint
+
+# Initialize Mediapipe Pose
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+def load_image(file_name):
+    return cv2.imread(file_name)
+
+def get_keypoints_from_image(image):
+    """
+    Get keypoints for shoulders, elbows, and hips from a given image using Mediapipe.
+    """
+    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not results.pose_landmarks:
+        return None
+    landmarks = results.pose_landmarks.landmark
+
+    keypoints = {
+        "left_shoulder": (int(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x * image.shape[1]),
+                          int(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y * image.shape[0])),
+        "right_shoulder": (int(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * image.shape[1]),
+                           int(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * image.shape[0])),
+        "left_elbow": (int(landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].x * image.shape[1]),
+                       int(landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].y * image.shape[0])),
+        "right_elbow": (int(landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].x * image.shape[1]),
+                        int(landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].y * image.shape[0])),
+        "left_hip": (int(landmarks[mp_pose.PoseLandmark.LEFT_HIP].x * image.shape[1]),
+                     int(landmarks[mp_pose.PoseLandmark.LEFT_HIP].y * image.shape[0])),
+        "right_hip": (int(landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x * image.shape[1]),
+                      int(landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y * image.shape[0]))
+    }
+    return keypoints
+
+def map_keypoints_to_handles(keypoints):
+    """
+    Convert the detected keypoints to the format required by compute_new_positions().
+    """
+    return [
+        keypoints["left_shoulder"],
+        keypoints["right_shoulder"],
+        keypoints["left_elbow"],
+        keypoints["right_elbow"],
+        keypoints["left_hip"],
+        keypoints["right_hip"]
+    ]
+
+def resize_and_overlay(base_img, overlay_img, position):
+    """
+    Resizes and overlays the transformed t-shirt onto the webcam frame.
+    """
+    overlay_img = cv2.resize(overlay_img, (base_img.shape[1], base_img.shape[0]))
+    x, y = position
+    for i in range(overlay_img.shape[0]):
+        for j in range(overlay_img.shape[1]):
+            if np.any(overlay_img[i, j] != 0):
+                base_img[y + i, x + j] = overlay_img[i, j]
+    return base_img
+
+def triangulate(boundary, max_segments):
+    """
+    Triangulates the boundary using equidistant points; used for deformable modeling.
+    """
+    area = Polygon(boundary)
+    bounds = area.bounds
+    min_x, min_y, max_x, max_y = bounds
+    dimension = max(max_x - min_x, max_y - min_y)
+    spacing = dimension / max_segments
+    boundary = adjust_boundary_segment_length(boundary, spacing)
+    area = Polygon(boundary)
+    points = [p for p in boundary]
+    y = min_y + spacing / 2
+    is_odd = True
+    while y < max_y:
+        x = min_x + spacing / 2
+        if is_odd:
+            x += spacing / 2
+        while x < max_x:
+            point = Point((x, y))
+            if area.contains(point):
+                points.append([x, y])
+            x += spacing
+        y += spacing
+        is_odd = not is_odd
+    triangulation_points = MultiPoint(points)
+    triangulation = shapely.ops.triangulate(triangulation_points)
+    result = [polygon for polygon in triangulation if area.contains(polygon.centroid)]
+    return result
+
+def get_edges_and_neighbors(triangulation):
+    """
+    Prepares meta information for edges and neighbors in the triangulation.
+    """
+    points = set()
+    point_index = {}
+    index_point = {}
+    edges = set()
+    edge_neighbors = {}
+    i = 0
+    for polygon in triangulation:
+        coordinates = list(polygon.exterior.coords)
+        triangle_points = [(coordinates[0][0], coordinates[0][1]), 
+                           (coordinates[1][0], coordinates[1][1]), 
+                           (coordinates[2][0], coordinates[2][1])]
+        for point in triangle_points:
+            if point not in points:
+                points.add(point)
+                point_index[point] = i
+                index_point[i] = point
+                i += 1
+    for polygon in triangulation:
+        coordinates = list(polygon.exterior.coords)
+        i_0, i_1, i_2 = [point_index[(coordinates[j][0], coordinates[j][1])] for j in range(3)]
+        triangle_edges = [(i_0, i_1), (i_1, i_2), (i_0, i_2)]
+        for i_a, i_b in triangle_edges:
+            i, j = min(i_a, i_b), max(i_a, i_b)
+            if (i, j) not in edges:
+                edges.add((i, j))
+                neighbors = {i_0, i_1, i_2}
+                edge_neighbors[(i, j)] = neighbors
+            else:
+                edge_neighbors[(i, j)].update([i_0, i_1, i_2])
+    points = [index_point[i] for i in range(len(index_point))]
+    return points, point_index, edges, edge_neighbors
+
+def registration(points, point_index, edges, edge_neighbors, triangulation):
+    """
+    Computes matrices for ARAP registration phase.
+    """
+    L_1 = np.zeros((2 * len(edges), 2 * len(points)))
+    L_2 = np.zeros((len(edges), len(points)))
+    G_ks = {}
+    T_ks = {}
+    row_1 = 0
+    row_2 = 0
+    for k, edge in enumerate(edges):
+        neighbors = edge_neighbors[edge]
+        dimension = len(neighbors)
+        v_i, v_j = edge
+        v_l = v_r = None
+        vertices = [v_i, v_j]
+        for v in neighbors:
+            if v != v_i and v != v_j:
+                v_l = v
+                vertices.append(v_l)
+                break
+        if dimension == 4:
+            for v in neighbors:
+                if v != v_i and v != v_j and v != v_l:
+                    v_r = v
+                    vertices.append(v_r)
+                    break
+        p_i, p_j = points[v_i], points[v_j]
+        p_l = points[v_l]
+        p_r = points[v_r] if dimension == 4 else None
+        e_k = np.subtract(p_j, p_i)
+        G_k = np.zeros((2 * dimension, 2))
+        G_k[0, 0], G_k[0, 1], G_k[1, 0], G_k[1, 1] = p_i[0], p_i[1], p_i[1], -p_i[0]
+        G_k[2, 0], G_k[2, 1], G_k[3, 0], G_k[3, 1] = p_j[0], p_j[1], p_j[1], -p_j[0]
+        G_k[4, 0], G_k[4, 1], G_k[5, 0], G_k[5, 1] = p_l[0], p_l[1], p_l[1], -p_l[0]
+        if p_r is not None:
+            G_k[6, 0], G_k[6, 1], G_k[7, 0], G_k[7, 1] = p_r[0], p_r[1], p_r[1], -p_r[0]
+        G_ks[(v_i, v_j)] = G_k
+        G_kTG_k = np.dot(G_k.T, G_k)
+        G_kTG_k_inv = np.linalg.inv(G_kTG_k)
+        T_k = np.dot(G_kTG_k_inv, G_k.T)
+        T_ks[(v_i, v_j)] = T_k
+        H_v = np.zeros((2, 2 * dimension))
+        H_v[0, 0], H_v[1, 1] = -1, -1
+        H_v[0, 2], H_v[1, 3] = 1, 1
+        H_e = np.zeros((2, 2))
+        H_e[0, 0], H_e[0, 1], H_e[1, 0], H_e[1, 1] = e_k[0], e_k[1], e_k[1], -e_k[0]
+        H = H_v - np.dot(H_e, T_k)
+        for i, v in enumerate(vertices):
+            L_1[row_1, v * 2], L_1[row_1, v * 2 + 1] = H[0, i * 2], H[0, i * 2 + 1]
+            L_1[row_1 + 1, v * 2], L_1[row_1 + 1, v * 2 + 1] = H[1, i * 2], H[1, i * 2 + 1]
+        row_1 += 2
+        L_2[row_2, v_i], L_2[row_2, v_j] = -1, 1
+        row_2 += 1
+    A_1_factor_1 = np.dot(L_1.T, L_1)
+    A_2_factor_1 = np.dot(L_2.T, L_2)
+    factors = {"A_1": np.vstack((L_1, np.zeros_like(L_1))), "A_2": np.vstack((L_2, np.zeros_like(L_2))),
+               "T_ks": T_ks, "G_ks": G_ks, "L_1": L_1, "L_2": L_2,
+               "A_1_factor1": A_1_factor_1, "A_2_factor1": A_2_factor_1}
+    return factors
+
+def compute_new_positions(points, edges, edge_neighbors, handles, weight, factors):
+    """
+    Computes new mesh deformation for given handle positions.
+    """
+    b_1 = np.zeros((2 * (len(edges) + len(handles)), 1))
+    row_1 = 0
+    for k, handle in enumerate(handles):
+        b_1[2 * len(edges) + row_1] = weight * handle[0]
+        b_1[2 * len(edges) + row_1 + 1] = weight * handle[1]
+        row_1 += 2
+    A_1 = factors["A_1"]
+    LHS = np.dot(A_1.T, A_1)
+    RHS = np.dot(A_1.T, b_1)
+    moved_vertices = np.linalg.solve(LHS, RHS)
+    moved_vertices = moved_vertices.reshape(-1, 2)
+    A_2 = factors["A_2"]
+    T_ks = factors["T_ks"]
+    T2_ks = {}
+    b2_x = np.zeros((len(edges) + len(handles), 1))
+    b2_y = np.zeros_like(b2_x)
+    for k, edge in enumerate(edges):
+        neighbors = edge_neighbors[edge]
+        dimension = len(neighbors)
+        v_i, v_j = edge
+        v_l = v_r = None
+        vertices = [v_i, v_j]
+        for v in neighbors:
+            if v != v_i and v != v_j:
+                v_l = v
+                vertices.append(v_l)
+                break
+        if dimension == 4:
+            for v in neighbors:
+                if v != v_i and v != v_j and v != v_l:
+                    v_r = v
+                    vertices.append(v_r)
+                    break
+        p_i, p_j = moved_vertices[v_i], moved_vertices[v_j]
+        p_l = moved_vertices[v_l]
+        p_r = moved_vertices[v_r] if dimension == 4 else None
+        e_k = np.subtract(p_j, p_i)
+        vs = np.zeros((2 * dimension, 1))
+        vs[0, 0], vs[1, 0], vs[2, 0], vs[3, 0] = p_i[0], p_i[1], p_j[0], p_j[1]
+        vs[4, 0], vs[5, 0] = p_l[0], p_l[1]
+        if dimension == 4:
+            vs[6, 0], vs[7, 0] = p_r[0], p_r[1]
+        T_k = T_ks[(v_i, v_j)]
+        rotations = np.dot(T_k, vs)
+        c_k, s_k = rotations[0, 0], rotations[1, 0]
+        norm = c_k * c_k + s_k * s_k
+        T2_k = np.zeros((2, 2))
+        T2_k[0, 0], T2_k[0, 1], T2_k[1, 0], T2_k[1, 1] = c_k / norm, s_k / norm, -s_k / norm, c_k / norm
+        T2_ks[(v_i, v_j)] = T2_k
+        e = np.zeros((2, 1))
+        e[0, 0], e[1, 0] = e_k[0], e_k[1]
+        re = np.dot(T2_k, e)
+        b2_x[k, 0], b2_y[k, 0] = re[0, 0], re[1, 0]
+    for k, handle in enumerate(handles):
+        b2_x[len(edges) + k] = weight * handle[0]
+        b2_y[len(edges) + k] = weight * handle[1]
+    LHS = np.dot(A_2.T, A_2)
+    RHS_x = np.dot(A_2.T, b2_x)
+    RHS_y = np.dot(A_2.T, b2_y)
+    vertices_x = np.linalg.solve(LHS, RHS_x)
+    vertices_y = np.linalg.solve(LHS, RHS_y)
+    vertices = np.hstack((vertices_x, vertices_y))
+    return vertices
+
+def visualize_image(texture, texture_coordinates, vertices, triangles, file_name=None):
+    """
+    Visualizes the warped image based on computed vertices.
+    """
+    result = np.zeros((texture.shape[0] + 50, texture.shape[1] + 50, texture.shape[2]))
+    for triangle in triangles:
+        i_0, i_1, i_2 = triangle
+        t_0, t_1, t_2 = texture_coordinates[i_0], texture_coordinates[i_1], texture_coordinates[i_2]
+        source = np.float32([[t_0, t_1, t_2]])
+        v_0, v_1, v_2 = vertices[i_0], vertices[i_1], vertices[i_2]
+        target = np.float32([[v_0, v_1, v_2]])
+        source_boundary = cv2.boundingRect(source)
+        target_boundary = cv2.boundingRect(target)
+        source_triangle = [(source[0][i][0] - source_boundary[0], source[0][i][1] - source_boundary[1]) for i in range(3)]
+        target_triangle = [(target[0][i][0] - target_boundary[0], target[0][i][1] - target_boundary[1]) for i in range(3)]
+        source_patch = texture[source_boundary[1]:source_boundary[1] + source_boundary[3], source_boundary[0]:source_boundary[0] + source_boundary[2]]
+        transform = cv2.getAffineTransform(np.float32(source_triangle), np.float32(target_triangle))
+        target_patch = cv2.warpAffine(source_patch, transform, (target_boundary[2], target_boundary[3]), None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        mask = np.zeros((target_boundary[3], target_boundary[2], 3), dtype=np.float32)
+        cv2.fillConvexPoly(mask, np.int32(target_triangle), (1.0, 1.0, 1.0), 16, 0)
+        target_patch = target_patch * mask
+        try:
+            result[target_boundary[1]:target_boundary[1] + target_boundary[3], target_boundary[0]:target_boundary[0] + target_boundary[2]] *= ((1.0, 1.0, 1.0) - mask)
+            result[target_boundary[1]:target_boundary[1] + target_boundary[3], target_boundary[0]:target_boundary[0] + target_boundary[2]] += target_patch
+        except:
+            pass
+    if file_name:
+        cv2.imwrite(file_name, result)
+    return result
+
+def virtual_try_on(tshirt_image_path, webcam_video=0, weight=1000):
+    """
+    Main function for real-time virtual t-shirt try-on.
+    """
+    tshirt_image = load_image(tshirt_image_path)
+    initial_keypoints = get_keypoints_from_image(tshirt_image)
+    if initial_keypoints is None:
+        print("Error: Could not detect keypoints on t-shirt image.")
+        return
+    initial_handles = map_keypoints_to_handles(initial_keypoints)
+    cap = cv2.VideoCapture(webcam_video)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        final_keypoints = get_keypoints_from_image(frame)
+        if final_keypoints is None:
+            continue
+        final_handles = map_keypoints_to_handles(final_keypoints)
+        triangulation = triangulate(initial_handles, 20)
+        points, point_index, edges, edge_neighbors = get_edges_and_neighbors(triangulation)
+        factors = registration(points, point_index, edges, edge_neighbors, triangulation)
+        vertices = compute_new_positions(points, edges, edge_neighbors, final_handles, weight, factors)
+        triangles = [(point_index[coordinates[0]], point_index[coordinates[1]], point_index[coordinates[2]]) for polygon in triangulation for coordinates in [list(polygon.exterior.coords)]]
+        warped_tshirt = visualize_image(tshirt_image, points, vertices, triangles)
+        overlayed_frame = resize_and_overlay(frame, warped_tshirt, (0, 0))
+        cv2.imshow("Virtual Try-On", overlayed_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Example call to the virtual try-on function
+tshirt_image_path = "tshirt_image.png"
+virtual_try_on(tshirt_image_path)
