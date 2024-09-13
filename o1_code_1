@@ -135,25 +135,44 @@ with mp_pose.Pose(min_detection_confidence=0.5,
             # Initialize output image
             output = np.zeros_like(image)
 
-            # Function to warp a triangle
+            # Function to warp a triangle (updated)
             def warp_triangle(img1, img2, t1, t2):
+                # Convert points to float32
+                t1 = np.float32(t1)
+                t2 = np.float32(t2)
+
                 # Find bounding rectangles for each triangle
-                r1 = cv2.boundingRect(np.float32([t1]))
-                r2 = cv2.boundingRect(np.float32([t2]))
+                r1 = cv2.boundingRect(t1)
+                r2 = cv2.boundingRect(t2)
                 
                 x1, y1, w1, h1 = r1
                 x2, y2, w2, h2 = r2
-                
+
+                # Ensure coordinates are integers
+                x1, y1, w1, h1 = int(x1), int(y1), int(w1), int(h1)
+                x2, y2, w2, h2 = int(x2), int(y2), int(w2), int(h2)
+
                 # Clip the rectangles to the image boundaries
+                x1 = max(0, min(x1, img1.shape[1] - 1))
+                y1 = max(0, min(y1, img1.shape[0] - 1))
+                x2 = max(0, min(x2, img2.shape[1] - 1))
+                y2 = max(0, min(y2, img2.shape[0] - 1))
+
                 x1_end = min(x1 + w1, img1.shape[1])
                 y1_end = min(y1 + h1, img1.shape[0])
-                w1 = x1_end - x1
-                h1 = y1_end - y1
-
                 x2_end = min(x2 + w2, img2.shape[1])
                 y2_end = min(y2 + h2, img2.shape[0])
+
+                # Recalculate widths and heights
+                w1 = x1_end - x1
+                h1 = y1_end - y1
                 w2 = x2_end - x2
                 h2 = y2_end - y2
+
+                # Check for non-positive dimensions
+                if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+                    # Skip this triangle
+                    return
 
                 # Offset points by the top-left corner of the respective rectangles
                 t1_rect = []
@@ -185,10 +204,11 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                 img1_rect_warped = cv2.warpAffine(img1_rect, warp_mat, size, None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
                 # Apply the mask to the warped patch
-                img1_rect_warped = img1_rect_warped * mask[:, :, np.newaxis]
+                mask_3ch = np.dstack((mask, mask, mask))
+                img1_rect_warped = img1_rect_warped * mask_3ch
 
                 # Blend the warped patch into the destination image
-                img2_rect = img2_rect * (1.0 - mask[:, :, np.newaxis])
+                img2_rect = img2_rect * (1.0 - mask_3ch)
                 img2_rect = img2_rect + img1_rect_warped
 
                 # Place the blended patch back into the image
