@@ -2,152 +2,193 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
+# Load the t-shirt image with an alpha channel (transparency)
+tshirt_img = cv2.imread('tshirt.png', cv2.IMREAD_UNCHANGED)
+
+# Separate the color and alpha channels
+if tshirt_img.shape[2] == 4:
+    alpha_channel = tshirt_img[:, :, 3]
+    rgb_channels = tshirt_img[:, :, :3]
+    # Create a mask where alpha is greater than 0
+    mask = alpha_channel > 0
+    tshirt_img = cv2.bitwise_and(rgb_channels, rgb_channels, mask=mask.astype(np.uint8))
+else:
+    mask = np.ones(tshirt_img.shape[:2], dtype=np.uint8) * 255
+
+# Get t-shirt image dimensions
+tshirt_height, tshirt_width = tshirt_img.shape[:2]
+
+# Define key points on the t-shirt image (manually)
+tshirt_points = {
+    'left_shoulder': (int(0.3 * tshirt_width), int(0.2 * tshirt_height)),
+    'right_shoulder': (int(0.7 * tshirt_width), int(0.2 * tshirt_height)),
+    'left_elbow': (int(0.2 * tshirt_width), int(0.5 * tshirt_height)),
+    'right_elbow': (int(0.8 * tshirt_width), int(0.5 * tshirt_height)),
+    'left_hip': (int(0.3 * tshirt_width), int(0.8 * tshirt_height)),
+    'right_hip': (int(0.7 * tshirt_width), int(0.8 * tshirt_height)),
+    # Add more points along the arms and torso as needed
+}
+
+# Convert points to a NumPy array
+src_points = np.array(list(tshirt_points.values()), dtype=np.float32)
+
 # Initialize MediaPipe Pose
-mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
 
-# Function to get pose landmarks from an image
-def get_pose_landmarks(image, pose):
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = pose.process(image_rgb)
-    if results.pose_landmarks:
-        landmarks = results.pose_landmarks.landmark
-        return landmarks
-    else:
-        return None
-
-# Function to extract required keypoints
-def extract_keypoints(landmarks, image_shape):
-    keypoints = {}
-    h, w = image_shape[:2]
-    
-    # Extracting keypoints and converting to pixel coordinates
-    keypoints['left_shoulder'] = (int(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x * w),
-                                  int(landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y * h))
-    keypoints['right_shoulder'] = (int(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * w),
-                                   int(landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * h))
-    keypoints['left_elbow'] = (int(landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].x * w),
-                               int(landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].y * h))
-    keypoints['right_elbow'] = (int(landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].x * w),
-                                int(landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].y * h))
-    keypoints['left_wrist'] = (int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].x * w),
-                               int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].y * h))
-    keypoints['right_wrist'] = (int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].x * w),
-                                int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].y * h))
-    keypoints['left_hip'] = (int(landmarks[mp_pose.PoseLandmark.LEFT_HIP].x * w),
-                             int(landmarks[mp_pose.PoseLandmark.LEFT_HIP].y * h))
-    keypoints['right_hip'] = (int(landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x * w),
-                              int(landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y * h))
-    return keypoints
-
-# Function to create Delaunay triangles from keypoints
-def create_triangles(points_dict):
-    # Create list of points
-    points = np.array(list(points_dict.values()))
-    # Perform Delaunay triangulation
-    subdiv = cv2.Subdiv2D((0, 0, 640, 480))  # Assuming 640x480 resolution
-    for p in points:
-        subdiv.insert((p[0], p[1]))
-    triangleList = subdiv.getTriangleList()
-    triangles = []
-    pts = points.tolist()
-    for t in triangleList:
-        pt1 = (int(t[0]), int(t[1]))
-        pt2 = (int(t[2]), int(t[3]))
-        pt3 = (int(t[4]), int(t[5]))
-        if pt1 in pts and pt2 in pts and pt3 in pts:
-            idx1 = pts.index(pt1)
-            idx2 = pts.index(pt2)
-            idx3 = pts.index(pt3)
-            triangles.append((idx1, idx2, idx3))
-    return triangles
-
-# Function to warp triangles
-def warp_triangle(img1, img2, t1, t2):
-    # Find bounding rectangle for each triangle
-    r1 = cv2.boundingRect(np.float32([t1]))
-    r2 = cv2.boundingRect(np.float32([t2]))
-
-    # Offset points by left top corner of the respective rectangles
-    t1_rect = []
-    t2_rect = []
-    t2_rect_int = []
-
-    for i in range(0, 3):
-        t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
-        t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
-        t2_rect_int.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
-
-    # Get mask by filling triangle
-    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
-    cv2.fillConvexPoly(mask, np.int32(t2_rect_int), (1.0, 1.0, 1.0), 16, 0)
-
-    # Apply warpImage to small rectangular patches
-    img1_rect = img1[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
-
-    size = (r2[2], r2[3])
-    warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
-    img2_rect = cv2.warpAffine(img1_rect, warp_mat, (size[0], size[1]), None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-
-    img2_rect = img2_rect * mask
-
-    # Copy triangular region of the rectangular patch to the output image
-    img2[r2[1]:r2[1] + r2[3], r2[0]:r2[0] + r2[2]] = img2[r2[1]:r2[1] + r2[3],
-                                                           r2[0]:r2[0] + r2[2]] * (1 - mask) + img2_rect
-
-# Load the t-shirt image and get its keypoints
-tshirt_image = cv2.imread('tshirt.png')  # Replace with your t-shirt image path
-tshirt_image = cv2.resize(tshirt_image, (640, 480))  # Resize for simplicity
-
-with mp_pose.Pose(static_image_mode=True, model_complexity=2) as pose:
-    tshirt_landmarks = get_pose_landmarks(tshirt_image, pose)
-    if tshirt_landmarks is None:
-        print("Could not detect landmarks on the t-shirt image.")
-        exit()
-    tshirt_keypoints = extract_keypoints(tshirt_landmarks, tshirt_image.shape)
-
-# Create a list of keypoints for Delaunay triangulation
-tshirt_points = np.array(list(tshirt_keypoints.values()))
-
-# Create Delaunay triangles for the t-shirt image
-tshirt_triangles = create_triangles(tshirt_keypoints)
-
-# Initialize webcam feed
+# Start the webcam feed
 cap = cv2.VideoCapture(0)
 
-with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+with mp_pose.Pose(min_detection_confidence=0.5,
+                  min_tracking_confidence=0.5) as pose:
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+        success, frame = cap.read()
+        if not success:
+            print("Failed to capture image")
             break
 
-        # Flip the frame horizontally for a later selfie-view display
+        # Flip and convert the image to RGB
         frame = cv2.flip(frame, 1)
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Get landmarks from the webcam frame
-        landmarks = get_pose_landmarks(frame, pose)
-        if landmarks:
-            frame_keypoints = extract_keypoints(landmarks, frame.shape)
-            frame_points = np.array(list(frame_keypoints.values()))
+        # Process the image and find pose landmarks
+        results = pose.process(image)
 
-            # Create an output image to blend
-            output = frame.copy()
+        # Convert the image color back for rendering
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        if results.pose_landmarks:
+            # Extract landmark points
+            landmarks = results.pose_landmarks.landmark
+
+            # Get image dimensions
+            img_h, img_w = image.shape[:2]
+
+            # Define destination points (key points on the person)
+            dst_points = {
+                'left_shoulder': (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x * img_w,
+                                  landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y * img_h),
+                'right_shoulder': (landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * img_w,
+                                   landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * img_h),
+                'left_elbow': (landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].x * img_w,
+                               landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].y * img_h),
+                'right_elbow': (landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].x * img_w,
+                                landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].y * img_h),
+                'left_hip': (landmarks[mp_pose.PoseLandmark.LEFT_HIP].x * img_w,
+                             landmarks[mp_pose.PoseLandmark.LEFT_HIP].y * img_h),
+                'right_hip': (landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x * img_w,
+                              landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y * img_h),
+                # Add more points as defined in tshirt_points
+            }
+
+            # Convert destination points to NumPy array
+            dst_points_array = np.array(list(dst_points.values()), dtype=np.float32)
+
+            # Create a bounding rectangle around the source points
+            rect = cv2.boundingRect(src_points)
+
+            # Subdivide the bounding rectangle into triangles
+            subdiv = cv2.Subdiv2D(rect)
+            for p in src_points:
+                point = (float(p[0]), float(p[1]))
+                subdiv.insert(point)
+
+            # Get the list of triangles
+            triangles = subdiv.getTriangleList()
+            triangles = np.array(triangles, dtype=np.float32)
+
+            # Function to find the index of a point
+            def find_index(points, coord):
+                for i, point in enumerate(points):
+                    if np.allclose(point, coord):
+                        return i
+                return -1
+
+            # List to hold triangle indices
+            triangle_indices = []
+
+            for t in triangles:
+                pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+                idx = []
+                for pt in pts:
+                    index = find_index(src_points, np.array(pt))
+                    if index != -1:
+                        idx.append(index)
+                if len(idx) == 3:
+                    triangle_indices.append(idx)
+
+            # Initialize output image
+            output = np.zeros_like(image)
+
+            # Function to warp a triangle
+            def warp_triangle(img1, img2, t1, t2):
+                # Find bounding rectangles for each triangle
+                r1 = cv2.boundingRect(np.float32([t1]))
+                r2 = cv2.boundingRect(np.float32([t2]))
+
+                # Offset points by the top-left corner of the respective rectangles
+                t1_rect = []
+                t2_rect = []
+                t2_rect_int = []
+
+                for i in range(3):
+                    t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
+                    t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
+                    t2_rect_int.append((int(t2[i][0] - r2[0]), int(t2[i][1] - r2[1])))
+
+                # Create mask by filling the triangle
+                mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+                cv2.fillConvexPoly(mask, np.int32(t2_rect_int), (1.0, 1.0, 1.0), 16, 0)
+
+                # Extract the patch from the t-shirt image
+                img1_rect = img1[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]]
+
+                # Warp the patch
+                size = (r2[2], r2[3])
+                warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
+                img2_rect = cv2.warpAffine(img1_rect, warp_mat, size, None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+
+                # Apply the mask to the warped patch
+                img2_rect = img2_rect * mask
+
+                # Copy the warped patch into the output image
+                img2_area = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
+                img2_area = img2_area * (1 - mask)
+                img2_area = img2_area + img2_rect
+
+                img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2_area
 
             # Warp each triangle
-            for triangle in tshirt_triangles:
-                x, y, z = triangle
-                t1 = [tshirt_points[x], tshirt_points[y], tshirt_points[z]]
-                t2 = [frame_points[x], frame_points[y], frame_points[z]]
+            for idx in triangle_indices:
+                t1 = [src_points[idx[0]], src_points[idx[1]], src_points[idx[2]]]
+                t2 = [dst_points_array[idx[0]], dst_points_array[idx[1]], dst_points_array[idx[2]]]
 
-                warp_triangle(tshirt_image, output, t1, t2)
+                warp_triangle(tshirt_img, output, t1, t2)
 
-            # Blend the output image with the frame
-            cv2.imshow('Virtual Try-On', output)
+            # Create a mask from the warped t-shirt image
+            gray_output = cv2.cvtColor(output, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray_output, 1, 255, cv2.THRESH_BINARY)
+            mask_inv = cv2.bitwise_not(mask)
+
+            # Black-out the area of the t-shirt in the frame
+            img_bg = cv2.bitwise_and(image, image, mask=mask_inv)
+
+            # Extract the t-shirt region from the warped image
+            tshirt_fg = cv2.bitwise_and(output, output, mask=mask)
+
+            # Combine the background and the t-shirt foreground
+            combined = cv2.add(img_bg, tshirt_fg)
+
+            # Display the final output
+            cv2.imshow('Virtual Try-On', combined)
+
         else:
-            cv2.imshow('Virtual Try-On', frame)
+            # No landmarks detected; display the frame
+            cv2.imshow('Virtual Try-On', image)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Exit on pressing 'ESC'
+        if cv2.waitKey(5) & 0xFF == 27:
             break
 
+# Release resources
 cap.release()
 cv2.destroyAllWindows()
