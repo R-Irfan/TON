@@ -2,35 +2,67 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-# Load the t-shirt image with an alpha channel (transparency)
-tshirt_img = cv2.imread('tshirt.png', cv2.IMREAD_UNCHANGED)
-
-# Separate the color and alpha channels
-if tshirt_img.shape[2] == 4:
-    alpha_channel = tshirt_img[:, :, 3]
-    rgb_channels = tshirt_img[:, :, :3]
-    # Create a mask where alpha is greater than 0
-    mask = alpha_channel > 0
-    tshirt_img = cv2.bitwise_and(rgb_channels, rgb_channels, mask=mask.astype(np.uint8))
-else:
-    mask = np.ones(tshirt_img.shape[:2], dtype=np.uint8) * 255
-
-# Define key points on the t-shirt image (manually)
-tshirt_points = {
-    'left_shoulder': (x1, y1),
-    'right_shoulder': (x2, y2),
-    'left_elbow': (x3, y3),
-    'right_elbow': (x4, y4),
-    'left_hip': (x5, y5),
-    'right_hip': (x6, y6),
-    # Add more points along the arms and torso as needed
-}
-
-# Convert points to a NumPy array
-src_points = np.array(list(tshirt_points.values()), dtype=np.float32)
-
 # Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
+
+# Function to get pose landmarks
+def get_pose_landmarks(image, pose):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = pose.process(image_rgb)
+    if results.pose_landmarks:
+        landmarks = results.pose_landmarks.landmark
+        return landmarks
+    else:
+        return None
+
+# Function to extract required keypoints
+def extract_keypoints(landmarks, image_shape):
+    keypoints = {}
+    h, w = image_shape[:2]
+    mp_pose_landmark = mp.solutions.pose.PoseLandmark
+
+    # Extracting keypoints and converting to pixel coordinates
+    keypoints['left_shoulder'] = (landmarks[mp_pose_landmark.LEFT_SHOULDER].x * w,
+                                  landmarks[mp_pose_landmark.LEFT_SHOULDER].y * h)
+    keypoints['right_shoulder'] = (landmarks[mp_pose_landmark.RIGHT_SHOULDER].x * w,
+                                   landmarks[mp_pose_landmark.RIGHT_SHOULDER].y * h)
+    keypoints['left_elbow'] = (landmarks[mp_pose_landmark.LEFT_ELBOW].x * w,
+                               landmarks[mp_pose_landmark.LEFT_ELBOW].y * h)
+    keypoints['right_elbow'] = (landmarks[mp_pose_landmark.RIGHT_ELBOW].x * w,
+                                landmarks[mp_pose_landmark.RIGHT_ELBOW].y * h)
+    keypoints['left_wrist'] = (landmarks[mp_pose_landmark.LEFT_WRIST].x * w,
+                               landmarks[mp_pose_landmark.LEFT_WRIST].y * h)
+    keypoints['right_wrist'] = (landmarks[mp_pose_landmark.RIGHT_WRIST].x * w,
+                                landmarks[mp_pose_landmark.RIGHT_WRIST].y * h)
+    keypoints['left_hip'] = (landmarks[mp_pose_landmark.LEFT_HIP].x * w,
+                             landmarks[mp_pose_landmark.LEFT_HIP].y * h)
+    keypoints['right_hip'] = (landmarks[mp_pose_landmark.RIGHT_HIP].x * w,
+                              landmarks[mp_pose_landmark.RIGHT_HIP].y * h)
+    # Add more keypoints if needed
+    return keypoints
+
+# Load the t-shirt image (ideally with a person wearing it)
+tshirt_img = cv2.imread('tshirt_image.jpg')
+
+# Check if the image was loaded
+if tshirt_img is None:
+    print("Error: T-shirt image not found or failed to load.")
+    exit()
+
+# Extract keypoints from the t-shirt image
+with mp_pose.Pose(static_image_mode=True,
+                  model_complexity=2,
+                  enable_segmentation=False,
+                  min_detection_confidence=0.5) as pose:
+    landmarks = get_pose_landmarks(tshirt_img, pose)
+    if landmarks:
+        tshirt_keypoints = extract_keypoints(landmarks, tshirt_img.shape)
+    else:
+        print("Error: No pose landmarks detected in the t-shirt image.")
+        exit()
+
+# Convert keypoints to NumPy array
+src_points = np.array(list(tshirt_keypoints.values()), dtype=np.float32)
 
 # Start the webcam feed
 cap = cv2.VideoCapture(0)
@@ -57,28 +89,16 @@ with mp_pose.Pose(min_detection_confidence=0.5,
             # Extract landmark points
             landmarks = results.pose_landmarks.landmark
 
-            # Get image dimensions
-            img_h, img_w = image.shape[:2]
-
-            # Define destination points (key points on the person)
-            dst_points = {
-                'left_shoulder': (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x * img_w,
-                                  landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y * img_h),
-                'right_shoulder': (landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * img_w,
-                                   landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * img_h),
-                'left_elbow': (landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].x * img_w,
-                               landmarks[mp_pose.PoseLandmark.LEFT_ELBOW].y * img_h),
-                'right_elbow': (landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].x * img_w,
-                                landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW].y * img_h),
-                'left_hip': (landmarks[mp_pose.PoseLandmark.LEFT_HIP].x * img_w,
-                             landmarks[mp_pose.PoseLandmark.LEFT_HIP].y * img_h),
-                'right_hip': (landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x * img_w,
-                              landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y * img_h),
-                # Add more points as defined in tshirt_points
-            }
+            # Extract keypoints from the landmarks
+            dst_keypoints = extract_keypoints(landmarks, image.shape)
 
             # Convert destination points to NumPy array
-            dst_points_array = np.array(list(dst_points.values()), dtype=np.float32)
+            dst_points_array = np.array(list(dst_keypoints.values()), dtype=np.float32)
+
+            # Ensure that the number of source and destination points match
+            if src_points.shape[0] != dst_points_array.shape[0]:
+                print("Error: Mismatch in number of keypoints.")
+                continue
 
             # Create a bounding rectangle around the source points
             rect = cv2.boundingRect(src_points)
