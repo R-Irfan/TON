@@ -1,0 +1,181 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+import os
+from collections import OrderedDict
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+
+# Function to get pose landmarks
+def get_pose_landmarks(image, pose):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = pose.process(image_rgb)
+    if results.pose_landmarks:
+        landmarks = results.pose_landmarks.landmark
+        return landmarks
+    else:
+        return None
+
+# Function to extract required keypoints
+def extract_keypoints(landmarks, image_shape):
+    keypoints = OrderedDict()
+    h, w = image_shape[:2]
+    mp_pose_landmark = mp.solutions.pose.PoseLandmark
+
+    # Extracting keypoints and converting to pixel coordinates
+    keypoints['nose'] = (landmarks[mp_pose_landmark.NOSE].x * w,
+                         landmarks[mp_pose_landmark.NOSE].y * h)
+    keypoints['left_shoulder'] = (landmarks[mp_pose_landmark.LEFT_SHOULDER].x * w,
+                                  landmarks[mp_pose_landmark.LEFT_SHOULDER].y * h)
+    keypoints['right_shoulder'] = (landmarks[mp_pose_landmark.RIGHT_SHOULDER].x * w,
+                                   landmarks[mp_pose_landmark.RIGHT_SHOULDER].y * h)
+    keypoints['left_elbow'] = (landmarks[mp_pose_landmark.LEFT_ELBOW].x * w,
+                               landmarks[mp_pose_landmark.LEFT_ELBOW].y * h)
+    keypoints['right_elbow'] = (landmarks[mp_pose_landmark.RIGHT_ELBOW].x * w,
+                                landmarks[mp_pose_landmark.RIGHT_ELBOW].y * h)
+    keypoints['left_wrist'] = (landmarks[mp_pose_landmark.LEFT_WRIST].x * w,
+                               landmarks[mp_pose_landmark.LEFT_WRIST].y * h)
+    keypoints['right_wrist'] = (landmarks[mp_pose_landmark.RIGHT_WRIST].x * w,
+                                landmarks[mp_pose_landmark.RIGHT_WRIST].y * h)
+    keypoints['left_hip'] = (landmarks[mp_pose_landmark.LEFT_HIP].x * w,
+                             landmarks[mp_pose_landmark.LEFT_HIP].y * h)
+    keypoints['right_hip'] = (landmarks[mp_pose_landmark.RIGHT_HIP].x * w,
+                              landmarks[mp_pose_landmark.RIGHT_HIP].y * h)
+    keypoints['left_knee'] = (landmarks[mp_pose_landmark.LEFT_KNEE].x * w,
+                              landmarks[mp_pose_landmark.LEFT_KNEE].y * h)
+    keypoints['right_knee'] = (landmarks[mp_pose_landmark.RIGHT_KNEE].x * w,
+                               landmarks[mp_pose_landmark.RIGHT_KNEE].y * h)
+    keypoints['left_ankle'] = (landmarks[mp_pose_landmark.LEFT_ANKLE].x * w,
+                               landmarks[mp_pose_landmark.LEFT_ANKLE].y * h)
+    keypoints['right_ankle'] = (landmarks[mp_pose_landmark.RIGHT_ANKLE].x * w,
+                                landmarks[mp_pose_landmark.RIGHT_ANKLE].y * h)
+    # Add more keypoints if needed
+    return keypoints
+
+# Load the t-shirt image (ideally with a person wearing it)
+tshirt_img = cv2.imread('tshirt_image.jpg')
+
+# Check if the image was loaded
+if tshirt_img is None:
+    print("Error: T-shirt image not found or failed to load.")
+    exit()
+
+# Define the amount of padding (in pixels)
+padding = 50  # Adjust this value as needed
+
+# Add padding to the t-shirt image
+tshirt_img_padded = cv2.copyMakeBorder(
+    tshirt_img,
+    top=padding,
+    bottom=padding,
+    left=padding,
+    right=padding,
+    borderType=cv2.BORDER_CONSTANT,
+    value=[0, 0, 0]  # Black padding
+)
+
+# Update the t-shirt image with the padded version
+tshirt_img = tshirt_img_padded
+
+# Extract keypoints from the t-shirt image
+with mp_pose.Pose(static_image_mode=True,
+                  model_complexity=2,
+                  enable_segmentation=False,
+                  min_detection_confidence=0.5) as pose:
+    landmarks = get_pose_landmarks(tshirt_img, pose)
+    if landmarks:
+        tshirt_keypoints = extract_keypoints(landmarks, tshirt_img.shape)
+    else:
+        print("Error: No pose landmarks detected in the t-shirt image.")
+        exit()
+
+# Offset keypoints by the padding amount (if padding was added before extraction, this step may not be needed)
+# If you extract keypoints after padding, you can skip this adjustment
+
+# Convert keypoints to NumPy array
+src_points = np.array(list(tshirt_keypoints.values()), dtype=np.float32)
+
+# Start the webcam feed
+cap = cv2.VideoCapture(0)
+
+with mp_pose.Pose(min_detection_confidence=0.5,
+                  min_tracking_confidence=0.5) as pose:
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            print("Failed to capture image")
+            break
+
+        # Flip and convert the image to RGB
+        frame = cv2.flip(frame, 1)
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Process the image and find pose landmarks
+        results = pose.process(image)
+
+        # Convert the image color back for rendering
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        if results.pose_landmarks:
+            # Extract landmark points
+            landmarks = results.pose_landmarks.landmark
+
+            # Extract keypoints from the landmarks
+            dst_keypoints = extract_keypoints(landmarks, image.shape)
+
+            # Convert destination points to NumPy array
+            dst_points_array = np.array(list(dst_keypoints.values()), dtype=np.float32)
+
+            # Ensure that the number of source and destination points match
+            if src_points.shape[0] != dst_points_array.shape[0]:
+                print("Error: Mismatch in number of keypoints.")
+                continue
+
+            # Prepare source and destination points for TPS
+            src_points_tps = src_points.reshape(-1, 1, 2)
+            dst_points_tps = dst_points_array.reshape(-1, 1, 2)
+
+            # Create TPS transformer
+            tps = cv2.createThinPlateSplineShapeTransformer()
+
+            # Create matches
+            matches = [cv2.DMatch(i, i, 0) for i in range(len(src_points))]
+
+            # Estimate transformation
+            tps.estimateTransformation(dst_points_tps, src_points_tps, matches)
+
+            # Warp the t-shirt image
+            tshirt_img_warped = tps.warpImage(tshirt_img)
+
+            # Create mask from the warped image
+            gray_warped = cv2.cvtColor(tshirt_img_warped, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray_warped, 1, 255, cv2.THRESH_BINARY)
+            mask_inv = cv2.bitwise_not(mask)
+
+            # Black-out the area of the t-shirt in the frame
+            img_bg = cv2.bitwise_and(image, image, mask=mask_inv)
+
+            # Extract the t-shirt region from the warped image
+            tshirt_fg = cv2.bitwise_and(tshirt_img_warped, tshirt_img_warped, mask=mask)
+
+            # Combine the background and the t-shirt foreground
+            combined = cv2.add(img_bg, tshirt_fg)
+
+            # Display the final output
+            cv2.imshow('Virtual Try-On', combined)
+
+        else:
+            # No landmarks detected; display the frame
+            cv2.imshow('Virtual Try-On', image)
+
+        # Exit on pressing 'ESC'
+        if cv2.waitKey(5) & 0xFF == 27:
+            break
+
+# Release resources
+cap.release()
+cv2.destroyAllWindows()
