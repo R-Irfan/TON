@@ -15,17 +15,14 @@ if tshirt_img.shape[2] == 4:
 else:
     mask = np.ones(tshirt_img.shape[:2], dtype=np.uint8) * 255
 
-# Get t-shirt image dimensions
-tshirt_height, tshirt_width = tshirt_img.shape[:2]
-
 # Define key points on the t-shirt image (manually)
 tshirt_points = {
-    'left_shoulder': (int(0.3 * tshirt_width), int(0.2 * tshirt_height)),
-    'right_shoulder': (int(0.7 * tshirt_width), int(0.2 * tshirt_height)),
-    'left_elbow': (int(0.2 * tshirt_width), int(0.5 * tshirt_height)),
-    'right_elbow': (int(0.8 * tshirt_width), int(0.5 * tshirt_height)),
-    'left_hip': (int(0.3 * tshirt_width), int(0.8 * tshirt_height)),
-    'right_hip': (int(0.7 * tshirt_width), int(0.8 * tshirt_height)),
+    'left_shoulder': (x1, y1),
+    'right_shoulder': (x2, y2),
+    'left_elbow': (x3, y3),
+    'right_elbow': (x4, y4),
+    'left_hip': (x5, y5),
+    'right_hip': (x6, y6),
     # Add more points along the arms and torso as needed
 }
 
@@ -89,8 +86,7 @@ with mp_pose.Pose(min_detection_confidence=0.5,
             # Subdivide the bounding rectangle into triangles
             subdiv = cv2.Subdiv2D(rect)
             for p in src_points:
-                point = (float(p[0]), float(p[1]))
-                subdiv.insert(point)
+                subdiv.insert((float(p[0]), float(p[1])))
 
             # Get the list of triangles
             triangles = subdiv.getTriangleList()
@@ -124,6 +120,20 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                 # Find bounding rectangles for each triangle
                 r1 = cv2.boundingRect(np.float32([t1]))
                 r2 = cv2.boundingRect(np.float32([t2]))
+                
+                x1, y1, w1, h1 = r1
+                x2, y2, w2, h2 = r2
+                
+                # Clip the rectangles to the image boundaries
+                x1_end = min(x1 + w1, img1.shape[1])
+                y1_end = min(y1 + h1, img1.shape[0])
+                w1 = x1_end - x1
+                h1 = y1_end - y1
+
+                x2_end = min(x2 + w2, img2.shape[1])
+                y2_end = min(y2 + h2, img2.shape[0])
+                w2 = x2_end - x2
+                h2 = y2_end - y2
 
                 # Offset points by the top-left corner of the respective rectangles
                 t1_rect = []
@@ -131,31 +141,38 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                 t2_rect_int = []
 
                 for i in range(3):
-                    t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
-                    t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
-                    t2_rect_int.append((int(t2[i][0] - r2[0]), int(t2[i][1] - r2[1])))
+                    t1_rect.append(((t1[i][0] - x1), (t1[i][1] - y1)))
+                    t2_rect.append(((t2[i][0] - x2), (t2[i][1] - y2)))
+                    t2_rect_int.append((int(t2[i][0] - x2), int(t2[i][1] - y2)))
 
                 # Create mask by filling the triangle
-                mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
-                cv2.fillConvexPoly(mask, np.int32(t2_rect_int), (1.0, 1.0, 1.0), 16, 0)
+                mask = np.zeros((h2, w2), dtype=np.float32)
+                cv2.fillConvexPoly(mask, np.int32(t2_rect_int), 1.0, 16, 0)
 
-                # Extract the patch from the t-shirt image
-                img1_rect = img1[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]]
+                # Extract the patches from the images
+                img1_rect = img1[y1:y1_end, x1:x1_end]
+                img2_rect = img2[y2:y2_end, x2:x2_end]
 
-                # Warp the patch
-                size = (r2[2], r2[3])
+                # Check if the sizes match
+                if img1_rect.shape[0] == 0 or img1_rect.shape[1] == 0:
+                    return
+                if img2_rect.shape[0] == 0 or img2_rect.shape[1] == 0:
+                    return
+
+                # Warp the patch from img1 to img2
+                size = (w2, h2)
                 warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
-                img2_rect = cv2.warpAffine(img1_rect, warp_mat, size, None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+                img1_rect_warped = cv2.warpAffine(img1_rect, warp_mat, size, None, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
                 # Apply the mask to the warped patch
-                img2_rect = img2_rect * mask
+                img1_rect_warped = img1_rect_warped * mask[:, :, np.newaxis]
 
-                # Copy the warped patch into the output image
-                img2_area = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
-                img2_area = img2_area * (1 - mask)
-                img2_area = img2_area + img2_rect
+                # Blend the warped patch into the destination image
+                img2_rect = img2_rect * (1.0 - mask[:, :, np.newaxis])
+                img2_rect = img2_rect + img1_rect_warped
 
-                img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2_area
+                # Place the blended patch back into the image
+                img2[y2:y2_end, x2:x2_end] = img2_rect
 
             # Warp each triangle
             for idx in triangle_indices:
